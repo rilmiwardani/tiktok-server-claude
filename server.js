@@ -39,7 +39,10 @@ wss.on('connection', (ws, request) => {
                     processInitialData: false,
                     enableExtendedGiftInfo: true,
                     enableWebsocketUpgrade: true,
-                    requestPollingIntervalMs: 1000
+                    requestPollingIntervalMs: 1000,
+                    requestOptions: {
+                        timeout: 10000
+                    }
                 });
                 
                 // Store connection
@@ -55,7 +58,8 @@ wss.on('connection', (ws, request) => {
                         ws.send(JSON.stringify({
                             type: 'connected',
                             uniqueId: uniqueId,
-                            roomId: state.roomId
+                            roomId: state.roomId,
+                            roomInfo: state.roomInfo || {}
                         }));
                     })
                     .catch(err => {
@@ -63,17 +67,26 @@ wss.on('connection', (ws, request) => {
                         activeConnections.delete(uniqueId);
                         ws.send(JSON.stringify({
                             type: 'error',
-                            message: err.message || 'Failed to connect to TikTok Live'
+                            message: err.message || 'Failed to connect to TikTok Live. Make sure the user is currently LIVE.'
                         }));
                     });
                 
-                // Handle TikTok events
+                // Handle TikTok events with full user data
                 tiktokLiveConnection.on('chat', data => {
+                    console.log('Chat event:', {
+                        username: data.uniqueId,
+                        nickname: data.nickname,
+                        comment: data.comment,
+                        profilePicture: data.profilePictureUrl
+                    });
+                    
                     ws.send(JSON.stringify({
                         type: 'chat',
                         username: data.uniqueId,
                         nickname: data.nickname,
                         message: data.comment,
+                        profilePictureUrl: data.profilePictureUrl || null,
+                        userId: data.userId || null,
                         timestamp: Date.now()
                     }));
                 });
@@ -83,9 +96,11 @@ wss.on('connection', (ws, request) => {
                         type: 'gift',
                         username: data.uniqueId,
                         nickname: data.nickname,
+                        profilePictureUrl: data.profilePictureUrl || null,
                         giftName: data.giftName,
                         giftId: data.giftId,
                         repeatCount: data.repeatCount,
+                        diamondCount: data.diamondCount || 0,
                         timestamp: Date.now()
                     }));
                 });
@@ -94,6 +109,8 @@ wss.on('connection', (ws, request) => {
                     ws.send(JSON.stringify({
                         type: 'like',
                         username: data.uniqueId,
+                        nickname: data.nickname,
+                        profilePictureUrl: data.profilePictureUrl || null,
                         likeCount: data.likeCount,
                         totalLikeCount: data.totalLikeCount,
                         timestamp: Date.now()
@@ -104,6 +121,8 @@ wss.on('connection', (ws, request) => {
                     ws.send(JSON.stringify({
                         type: 'share',
                         username: data.uniqueId,
+                        nickname: data.nickname,
+                        profilePictureUrl: data.profilePictureUrl || null,
                         timestamp: Date.now()
                     }));
                 });
@@ -112,6 +131,28 @@ wss.on('connection', (ws, request) => {
                     ws.send(JSON.stringify({
                         type: 'follow',
                         username: data.uniqueId,
+                        nickname: data.nickname,
+                        profilePictureUrl: data.profilePictureUrl || null,
+                        timestamp: Date.now()
+                    }));
+                });
+                
+                tiktokLiveConnection.on('member', data => {
+                    ws.send(JSON.stringify({
+                        type: 'member',
+                        username: data.uniqueId,
+                        nickname: data.nickname,
+                        profilePictureUrl: data.profilePictureUrl || null,
+                        memberCount: data.memberCount || 0,
+                        timestamp: Date.now()
+                    }));
+                });
+                
+                tiktokLiveConnection.on('roomUser', data => {
+                    ws.send(JSON.stringify({
+                        type: 'roomUser',
+                        viewerCount: data.viewerCount || 0,
+                        topViewers: data.topViewers || [],
                         timestamp: Date.now()
                     }));
                 });
@@ -131,6 +172,14 @@ wss.on('connection', (ws, request) => {
                     }));
                     activeConnections.delete(uniqueId);
                 });
+                
+                tiktokLiveConnection.on('error', (err) => {
+                    console.error('TikTok connection error:', err);
+                    ws.send(JSON.stringify({
+                        type: 'error',
+                        message: err.message
+                    }));
+                });
             }
             
             if (data.type === 'disconnect') {
@@ -139,6 +188,10 @@ wss.on('connection', (ws, request) => {
                 if (connection) {
                     connection.tiktok.disconnect();
                     activeConnections.delete(uniqueId);
+                    ws.send(JSON.stringify({
+                        type: 'disconnected',
+                        message: 'Disconnected successfully'
+                    }));
                 }
             }
             
@@ -161,16 +214,38 @@ wss.on('connection', (ws, request) => {
             }
         });
     });
+    
+    ws.on('error', (error) => {
+        console.error('WebSocket error:', error);
+    });
 });
 
 // Health check endpoint
 app.get('/health', (req, res) => {
-    res.json({ status: 'ok', connections: activeConnections.size });
+    res.json({ 
+        status: 'ok', 
+        connections: activeConnections.size,
+        uptime: process.uptime(),
+        timestamp: new Date().toISOString()
+    });
+});
+
+// Get active connections
+app.get('/connections', (req, res) => {
+    const connections = [];
+    activeConnections.forEach((connection, uniqueId) => {
+        connections.push({
+            uniqueId: uniqueId,
+            connected: true
+        });
+    });
+    res.json({ connections });
 });
 
 // Create HTTP server
 const server = app.listen(PORT, () => {
     console.log(`🚀 TikTok Wordle Backend running on port ${PORT}`);
+    console.log(`📊 Health check: http://localhost:${PORT}/health`);
 });
 
 // Upgrade HTTP server to WebSocket
@@ -183,6 +258,17 @@ server.on('upgrade', (request, socket, head) => {
 // Graceful shutdown
 process.on('SIGTERM', () => {
     console.log('SIGTERM received, closing server...');
+    activeConnections.forEach(connection => {
+        connection.tiktok.disconnect();
+    });
+    server.close(() => {
+        console.log('Server closed');
+        process.exit(0);
+    });
+});
+
+process.on('SIGINT', () => {
+    console.log('SIGINT received, closing server...');
     activeConnections.forEach(connection => {
         connection.tiktok.disconnect();
     });
