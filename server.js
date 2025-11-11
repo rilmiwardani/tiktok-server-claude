@@ -1,279 +1,86 @@
-const { WebcastPushConnection } = require('tiktok-live-connector');
-const WebSocket = require('ws');
+require('dotenv').config();
+
 const express = require('express');
-const cors = require('cors');
+const { createServer } = require('http');
+const { Server } = require('socket.io');
+const { TikTokConnectionWrapper, getGlobalConnectionCount } = require('./connectionWrapper');
+const { clientBlocked } = require('./limiter');
 
 const app = express();
-app.use(cors());
-app.use(express.json());
+const httpServer = createServer(app);
 
-const PORT = process.env.PORT || 8080;
+// Enable cross origin resource sharing
+const io = new Server(httpServer, {
+    cors: {
+        origin: '*'
+    }
+});
 
-// Store active connections
-const activeConnections = new Map();
+io.on('connection', (socket) => {
+    let tiktokConnectionWrapper;
 
-// Create WebSocket server
-const wss = new WebSocket.Server({ noServer: true });
+    console.info('New connection from origin', socket.handshake.headers['origin'] || socket.handshake.headers['referer']);
 
-wss.on('connection', (ws, request) => {
-    console.log('New WebSocket connection');
-    
-    ws.on('message', async (message) => {
+    socket.on('setUniqueId', (uniqueId, options) => {
+
+        // Prohibit the client from specifying these options (for security reasons)
+        if (typeof options === 'object' && options) {
+            delete options.requestOptions;
+            delete options.websocketOptions;
+        } else {
+            options = {};
+        }
+
+        // Session ID in .env file is optional
+        if (process.env.SESSIONID) {
+            options.sessionId = process.env.SESSIONID;
+            console.info('Using SessionId');
+        }
+
+        // Check if rate limit exceeded
+        if (process.env.ENABLE_RATE_LIMIT && clientBlocked(io, socket)) {
+            socket.emit('tiktokDisconnected', 'You have opened too many connections or made too many connection requests. Please reduce the number of connections/requests or host your own server instance. The connections are limited to avoid that the server IP gets blocked by TokTok.');
+            return;
+        }
+
+        // Connect to the given username (uniqueId)
         try {
-            const data = JSON.parse(message);
-            
-            if (data.type === 'connect') {
-                const uniqueId = data.uniqueId.replace('@', '');
-                
-                // Check if already connected
-                if (activeConnections.has(uniqueId)) {
-                    ws.send(JSON.stringify({
-                        type: 'error',
-                        message: 'Already connected to this live'
-                    }));
-                    return;
-                }
-                
-                // Create TikTok connection
-                const tiktokLiveConnection = new WebcastPushConnection(uniqueId, {
-                    processInitialData: false,
-                    enableExtendedGiftInfo: true,
-                    enableWebsocketUpgrade: true,
-                    requestPollingIntervalMs: 1000,
-                    requestOptions: {
-                        timeout: 10000
-                    }
-                });
-                
-                // Store connection
-                activeConnections.set(uniqueId, {
-                    ws: ws,
-                    tiktok: tiktokLiveConnection
-                });
-                
-                // Connect to TikTok Live
-                tiktokLiveConnection.connect()
-                    .then(state => {
-                        console.log(`Connected to @${uniqueId}`);
-                        ws.send(JSON.stringify({
-                            type: 'connected',
-                            uniqueId: uniqueId,
-                            roomId: state.roomId,
-                            roomInfo: state.roomInfo || {}
-                        }));
-                    })
-                    .catch(err => {
-                        console.error('Connection failed:', err);
-                        activeConnections.delete(uniqueId);
-                        ws.send(JSON.stringify({
-                            type: 'error',
-                            message: err.message || 'Failed to connect to TikTok Live. Make sure the user is currently LIVE.'
-                        }));
-                    });
-                
-                // Handle TikTok events with full user data
-                tiktokLiveConnection.on('chat', data => {
-                    console.log('Chat event:', {
-                        username: data.uniqueId,
-                        nickname: data.nickname,
-                        comment: data.comment,
-                        profilePicture: data.profilePictureUrl
-                    });
-                    
-                    ws.send(JSON.stringify({
-                        type: 'chat',
-                        username: data.uniqueId,
-                        nickname: data.nickname,
-                        message: data.comment,
-                        profilePictureUrl: data.profilePictureUrl || null,
-                        userId: data.userId || null,
-                        timestamp: Date.now()
-                    }));
-                });
-                
-                tiktokLiveConnection.on('gift', data => {
-                    ws.send(JSON.stringify({
-                        type: 'gift',
-                        username: data.uniqueId,
-                        nickname: data.nickname,
-                        profilePictureUrl: data.profilePictureUrl || null,
-                        giftName: data.giftName,
-                        giftId: data.giftId,
-                        repeatCount: data.repeatCount,
-                        diamondCount: data.diamondCount || 0,
-                        timestamp: Date.now()
-                    }));
-                });
-                
-                tiktokLiveConnection.on('like', data => {
-                    ws.send(JSON.stringify({
-                        type: 'like',
-                        username: data.uniqueId,
-                        nickname: data.nickname,
-                        profilePictureUrl: data.profilePictureUrl || null,
-                        likeCount: data.likeCount,
-                        totalLikeCount: data.totalLikeCount,
-                        timestamp: Date.now()
-                    }));
-                });
-                
-                tiktokLiveConnection.on('share', data => {
-                    ws.send(JSON.stringify({
-                        type: 'share',
-                        username: data.uniqueId,
-                        nickname: data.nickname,
-                        profilePictureUrl: data.profilePictureUrl || null,
-                        timestamp: Date.now()
-                    }));
-                });
-                
-                tiktokLiveConnection.on('follow', data => {
-                    ws.send(JSON.stringify({
-                        type: 'follow',
-                        username: data.uniqueId,
-                        nickname: data.nickname,
-                        profilePictureUrl: data.profilePictureUrl || null,
-                        timestamp: Date.now()
-                    }));
-                });
-                
-                tiktokLiveConnection.on('member', data => {
-                    ws.send(JSON.stringify({
-                        type: 'member',
-                        username: data.uniqueId,
-                        nickname: data.nickname,
-                        profilePictureUrl: data.profilePictureUrl || null,
-                        memberCount: data.memberCount || 0,
-                        timestamp: Date.now()
-                    }));
-                });
-                
-                tiktokLiveConnection.on('roomUser', data => {
-                    ws.send(JSON.stringify({
-                        type: 'roomUser',
-                        viewerCount: data.viewerCount || 0,
-                        topViewers: data.topViewers || [],
-                        timestamp: Date.now()
-                    }));
-                });
-                
-                tiktokLiveConnection.on('streamEnd', () => {
-                    ws.send(JSON.stringify({
-                        type: 'streamEnd',
-                        message: 'Live stream has ended'
-                    }));
-                    activeConnections.delete(uniqueId);
-                });
-                
-                tiktokLiveConnection.on('disconnect', () => {
-                    ws.send(JSON.stringify({
-                        type: 'disconnected',
-                        message: 'Disconnected from TikTok Live'
-                    }));
-                    activeConnections.delete(uniqueId);
-                });
-                
-                tiktokLiveConnection.on('error', (err) => {
-                    console.error('TikTok connection error:', err);
-                    ws.send(JSON.stringify({
-                        type: 'error',
-                        message: err.message
-                    }));
-                });
-            }
-            
-            if (data.type === 'disconnect') {
-                const uniqueId = data.uniqueId;
-                const connection = activeConnections.get(uniqueId);
-                if (connection) {
-                    connection.tiktok.disconnect();
-                    activeConnections.delete(uniqueId);
-                    ws.send(JSON.stringify({
-                        type: 'disconnected',
-                        message: 'Disconnected successfully'
-                    }));
-                }
-            }
-            
-        } catch (error) {
-            console.error('Error handling message:', error);
-            ws.send(JSON.stringify({
-                type: 'error',
-                message: error.message
-            }));
+            tiktokConnectionWrapper = new TikTokConnectionWrapper(uniqueId, options, true);
+            tiktokConnectionWrapper.connect();
+        } catch (err) {
+            socket.emit('tiktokDisconnected', err.toString());
+            return;
+        }
+
+        // === OPTIMALISASI ===
+        // Pindahkan semua logika penerusan event ke dalam wrapper.
+        // server.js sekarang bersih dan hanya memanggil satu fungsi.
+        tiktokConnectionWrapper.forwardEventsTo(socket);
+
+        // HAPUS SEMUA BLOK .on('roomUser'...) LAMA
+        // tiktokConnectionWrapper.once('connected', ...); // Dipindah ke forwardEventsTo
+        // tiktokConnectionWrapper.once('disconnected', ...); // Dipindah ke forwardEventsTo
+        // tiktokConnectionWrapper.connection.on('streamEnd', ...); // Dipindah ke forwardEventsTo
+        // tiktokConnectionWrapper.connection.on('roomUser', ...); // Dipindah ke forwardEventsTo
+        // ...dan seterusnya...
+    });
+
+    socket.on('disconnect', () => {
+        if (tiktokConnectionWrapper) {
+            tiktokConnectionWrapper.disconnect();
         }
     });
-    
-    ws.on('close', () => {
-        console.log('WebSocket connection closed');
-        // Clean up connections
-        activeConnections.forEach((connection, uniqueId) => {
-            if (connection.ws === ws) {
-                connection.tiktok.disconnect();
-                activeConnections.delete(uniqueId);
-            }
-        });
-    });
-    
-    ws.on('error', (error) => {
-        console.error('WebSocket error:', error);
-    });
 });
 
-// Health check endpoint
-app.get('/health', (req, res) => {
-    res.json({ 
-        status: 'ok', 
-        connections: activeConnections.size,
-        uptime: process.uptime(),
-        timestamp: new Date().toISOString()
-    });
-});
+// Emit global connection statistics
+setInterval(() => {
+    io.emit('statistic', { globalConnectionCount: getGlobalConnectionCount() });
+}, 5000)
 
-// Get active connections
-app.get('/connections', (req, res) => {
-    const connections = [];
-    activeConnections.forEach((connection, uniqueId) => {
-        connections.push({
-            uniqueId: uniqueId,
-            connected: true
-        });
-    });
-    res.json({ connections });
-});
+// Serve frontend files
+app.use(express.static('public'));
 
-// Create HTTP server
-const server = app.listen(PORT, () => {
-    console.log(`🚀 TikTok Wordle Backend running on port ${PORT}`);
-    console.log(`📊 Health check: http://localhost:${PORT}/health`);
-});
-
-// Upgrade HTTP server to WebSocket
-server.on('upgrade', (request, socket, head) => {
-    wss.handleUpgrade(request, socket, head, (ws) => {
-        wss.emit('connection', ws, request);
-    });
-});
-
-// Graceful shutdown
-process.on('SIGTERM', () => {
-    console.log('SIGTERM received, closing server...');
-    activeConnections.forEach(connection => {
-        connection.tiktok.disconnect();
-    });
-    server.close(() => {
-        console.log('Server closed');
-        process.exit(0);
-    });
-});
-
-process.on('SIGINT', () => {
-    console.log('SIGINT received, closing server...');
-    activeConnections.forEach(connection => {
-        connection.tiktok.disconnect();
-    });
-    server.close(() => {
-        console.log('Server closed');
-        process.exit(0);
-    });
-});
+// Start http listener
+const port = process.env.PORT || 8081;
+httpServer.listen(port);
+console.info(`Server running! Please visit http://localhost:${port}`);
