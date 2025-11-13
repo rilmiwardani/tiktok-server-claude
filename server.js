@@ -77,15 +77,6 @@ setInterval(() => {
     io.emit('statistic', { globalConnectionCount: getGlobalConnectionCount() });
 }, 5000)
 
-
-// Anda bisa membuat endpoint rahasia:
-app.get('/admin-refresh-all', (req, res) => {
-    
-     // Ini adalah perintah intinya:
-     console.log("ADMIN: Memicu force-refresh ke semua klien!");
-     io.emit('force-refresh', { message: 'Update baru tersedia!' });
-     
-     res.send('Perintah refresh terkirim!');
 // Serve frontend files
 app.use(express.static('public'));
 
@@ -93,4 +84,5 @@ app.use(express.static('public'));
 const port = process.env.PORT || 8081;
 httpServer.listen(port);
 console.info(`Server running! Please visit http://localhost:${port}`);
+
 
